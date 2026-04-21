@@ -1,0 +1,44 @@
+spring:
+  # 动态数据源配置
+  datasource:
+    dynamic:
+      # 设置默认数据源，这里默认用mysql，可根据需要修改
+      primary: mysql
+      # 严格模式：如果指定的数据源不存在，直接抛出异常，方便排查问题
+      strict: true
+      # 多数据源配置
+      datasource:
+        # MySQL数据源，dbName传"mysql"即可使用
+        mysql:
+          driver-class-name: com.mysql.cj.jdbc.Driver
+          url: jdbc:mysql://localhost:3306/test?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false
+          username: root
+          password: root
+        # Oracle数据源，dbName传"oracle"即可使用
+        oracle:
+          driver-class-name: oracle.jdbc.OracleDriver
+          url: jdbc:oracle:thin:@//localhost:1521/ORCLPDB1
+          username: system
+          password: oracle
+        # OceanBase数据源，dbName传"oceanbase"即可使用
+        oceanbase:
+          driver-class-name: com.oceanbase.jdbc.Driver
+          url: jdbc:oceanbase://localhost:2883/test?useUnicode=true&characterEncoding=utf8&useSSL=false
+          # OceanBase用户名格式：用户名@租户名，例如root@test
+          username: root@test
+          password: oceanbase
+        # openGauss数据源，dbName传"opengauss"即可使用
+        opengauss:
+          driver-class-name: org.opengauss.Driver
+          url: jdbc:postgresql://localhost:5432/test?useUnicode=true&characterEncoding=utf8
+          username: root
+          password: openGauss@123
+
+# 日志配置，方便查看执行日志
+logging:
+  level:
+    com.example.multidb: debug
+    com.baomidou.dynamic: debug
+
+server:
+  port: 8080
