@@ -4,6 +4,13 @@ import com.baomidou.dynamic.datasource.toolkit.DynamicDataSourceContextHolder;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -16,9 +23,12 @@ public class SqlQueryService {
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(SqlQueryService.class);
 
     private final JdbcTemplate jdbcTemplate;
+    private final DataSource dataSource;
+    private final Map<String, String> dbTypeCache = new HashMap<>();
 
-    public SqlQueryService(JdbcTemplate jdbcTemplate) {
+    public SqlQueryService(JdbcTemplate jdbcTemplate, DataSource dataSource) {
         this.jdbcTemplate = jdbcTemplate;
+        this.dataSource = dataSource;
     }
 
     /**
@@ -45,5 +55,269 @@ public class SqlQueryService {
             DynamicDataSourceContextHolder.clear();
             log.info("清除数据源上下文：{}", dbName);
         }
+    }
+
+    /**
+     * 获取数据库表结构元数据
+     * @param dbName 数据源名称
+     * @param schema Schema名称（Oracle传用户名，openGauss传public，MySQL/OceanBase可传null）
+     * @return 表结构元数据
+     */
+    public List<Map<String, Object>> getTableSchema(String dbName, String schema) {
+        if (dbName == null || dbName.trim().isEmpty()) {
+            throw new IllegalArgumentException("数据库名称不能为空");
+        }
+        log.info("获取表结构元数据，数据源：{}，schema：{}", dbName, schema);
+        try {
+            DynamicDataSourceContextHolder.push(dbName);
+
+            // 获取数据库类型
+            String dbType = getDbType(dbName);
+
+            // 根据数据库类型执行不同的元数据查询
+            if ("mysql".equals(dbType) || "oceanbase".equals(dbType)) {
+                return queryMetadataForMySQL(dbName);
+            } else if ("oracle".equals(dbType)) {
+                return queryMetadataForOracle(schema);
+            } else if ("postgresql".equals(dbType) || "opengauss".equals(dbType)) {
+                return queryMetadataForPostgreSQL(schema);
+            } else {
+                throw new IllegalArgumentException("不支持的数据库类型：" + dbType);
+            }
+        } finally {
+            DynamicDataSourceContextHolder.clear();
+            log.info("清除数据源上下文：{}", dbName);
+        }
+    }
+
+    /**
+     * 检测数据库类型
+     */
+    private String getDbType(String dataSourceName) {
+        if (dbTypeCache.containsKey(dataSourceName)) {
+            return dbTypeCache.get(dataSourceName);
+        }
+
+        try (Connection conn = dataSource.getConnection()) {
+            DatabaseMetaData metaData = conn.getMetaData();
+            String productName = metaData.getDatabaseProductName();
+            String url = metaData.getURL();
+
+            String dbType;
+            if (productName != null && productName.toLowerCase().contains("oracle")) {
+                dbType = "oracle";
+            } else if (productName != null && productName.toLowerCase().contains("postgresql")) {
+                dbType = "opengauss";
+            } else if (url != null && url.toLowerCase().contains("oceanbase")) {
+                dbType = "oceanbase";
+            } else {
+                dbType = "mysql";
+            }
+
+            dbTypeCache.put(dataSourceName, dbType);
+            log.info("数据源 {} 数据库类型：{} (JDBC productName: {})", dataSourceName, dbType, productName);
+            return dbType;
+        } catch (SQLException e) {
+            throw new RuntimeException("无法检测数据库类型", e);
+        }
+    }
+
+    /**
+     * MySQL / OceanBase (MySQL兼容模式) 元数据查询
+     */
+    private List<Map<String, Object>> queryMetadataForMySQL(String dbName) {
+        // 获取所有表及注释
+        String tableSql = "SELECT TABLE_NAME, TABLE_COMMENT " +
+                "FROM information_schema.tables " +
+                "WHERE table_schema = DATABASE() AND TABLE_TYPE = 'BASE TABLE' " +
+                "ORDER BY TABLE_NAME";
+
+        List<Map<String, Object>> tables = jdbcTemplate.queryForList(tableSql);
+
+        // 获取所有主键信息
+        String pkSql = "SELECT TABLE_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) AS PK_COLUMNS " +
+                "FROM information_schema.KEY_COLUMN_USAGE " +
+                "WHERE table_schema = DATABASE() AND CONSTRAINT_NAME = 'PRIMARY' " +
+                "GROUP BY TABLE_NAME";
+        List<Map<String, Object>> pkList = jdbcTemplate.queryForList(pkSql);
+        Map<String, String> pkMap = buildPrimaryKeyMap(pkList);
+
+        // 获取所有列信息
+        String columnSql = "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT, COLUMN_TYPE, " +
+                "CASE WHEN IS_NULLABLE = 'YES' THEN 1 ELSE 0 END AS IS_NULLABLE " +
+                "FROM information_schema.columns " +
+                "WHERE table_schema = DATABASE() " +
+                "ORDER BY TABLE_NAME, ORDINAL_POSITION";
+        List<Map<String, Object>> allColumns = jdbcTemplate.queryForList(columnSql);
+        Map<String, List<Map<String, Object>>> columnsByTable = groupColumnsByTable(allColumns, pkMap);
+
+        // 组装结果
+        return buildTableSchemaResult(tables, columnsByTable, pkMap);
+    }
+
+    /**
+     * Oracle 元数据查询
+     */
+    private List<Map<String, Object>> queryMetadataForOracle(String schema) {
+        String upperSchema = (schema != null && !schema.isEmpty()) ? schema.toUpperCase() : "USER";
+
+        // 获取所有表及注释
+        String tableSql = "SELECT t.TABLE_Name, c.Comments AS TABLE_COMMENT " +
+                "FROM ALL_TABLES t " +
+                "LEFT JOIN ALL_TAB_COMMENTS c ON c.TABLE_NAME = t.TABLE_NAME AND c.OWNER = t.OWNER " +
+                "WHERE t.OWNER = '" + upperSchema + "' " +
+                "ORDER BY t.TABLE_NAME";
+
+        List<Map<String, Object>> tables = jdbcTemplate.queryForList(tableSql);
+
+        // 获取所有主键信息
+        String pkSql = "SELECT acc.Table_Name, LISTAGG(accol.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY accol.POSITION) AS PK_COLUMNS " +
+                "FROM ALL_CONSTRAINTS acc " +
+                "JOIN ALL_CON_COLUMNS accol ON acc.CONSTRAINT_NAME = accol.CONSTRAINT_NAME AND acc.OWNER = accol.OWNER " +
+                "WHERE acc.OWNER = '" + upperSchema + "' AND acc.CONSTRAINT_TYPE = 'P' " +
+                "GROUP BY acc.Table_Name";
+        List<Map<String, Object>> pkList = jdbcTemplate.queryForList(pkSql);
+        Map<String, String> pkMap = buildPrimaryKeyMap(pkList);
+
+        // 获取所有列信息
+        String columnSql = "SELECT tc.TABLE_NAME, tc.COLUMN_NAME, cc.COMMENTS AS COLUMN_COMMENT, " +
+                "tc.DATA_TYPE, tc.DATA_LENGTH, " +
+                "CASE WHEN tc.NULLABLE = 'Y' THEN 1 ELSE 0 END AS IS_NULLABLE " +
+                "FROM ALL_TAB_COLS tc " +
+                "LEFT JOIN ALL_COL_COMMENTS cc ON cc.TABLE_NAME = tc.TABLE_NAME " +
+                "    AND cc.COLUMN_NAME = tc.COLUMN_NAME AND cc.OWNER = tc.OWNER " +
+                "WHERE tc.OWNER = '" + upperSchema + "' AND tc.HIDDEN_COLUMN = 'NO' " +
+                "ORDER BY tc.TABLE_NAME, tc.COLUMN_ID";
+        List<Map<String, Object>> allColumns = jdbcTemplate.queryForList(columnSql);
+        Map<String, List<Map<String, Object>>> columnsByTable = groupColumnsByTable(allColumns, pkMap);
+
+        // 组装结果
+        return buildTableSchemaResult(tables, columnsByTable, pkMap);
+    }
+
+    /**
+     * openGauss (PostgreSQL兼容) 元数据查询
+     */
+    private List<Map<String, Object>> queryMetadataForPostgreSQL(String schema) {
+        String targetSchema = (schema != null && !schema.isEmpty()) ? schema : "public";
+
+        // 获取所有表及注释
+        String tableSql = "SELECT c.relname AS TABLE_NAME, " +
+                "COALESCE(obj_description(c.oid, 'pg_class'), '') AS TABLE_COMMENT " +
+                "FROM pg_class c " +
+                "JOIN pg_namespace n ON c.relnamespace = n.oid " +
+                "WHERE n.nspname = '" + targetSchema + "' AND c.relkind = 'r' " +
+                "ORDER BY c.relname";
+
+        List<Map<String, Object>> tables = jdbcTemplate.queryForList(tableSql);
+
+        // 获取所有主键信息
+        String pkSql = "SELECT t.relname AS TABLE_NAME, " +
+                "string_agg(a.attname, ',' ORDER BY array_position(pk.conkey, a.attnum)) AS PK_COLUMNS " +
+                "FROM pg_constraint pk " +
+                "JOIN pg_class t ON pk.conrelid = t.oid " +
+                "JOIN pg_namespace n ON t.relnamespace = n.oid " +
+                "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(pk.conkey) " +
+                "WHERE n.nspname = '" + targetSchema + "' AND pk.contype = 'p' " +
+                "GROUP BY t.relname";
+        List<Map<String, Object>> pkList = jdbcTemplate.queryForList(pkSql);
+        Map<String, String> pkMap = buildPrimaryKeyMap(pkList);
+
+        // 获取所有列信息
+        String columnSql = "SELECT c.relname AS TABLE_NAME, a.attname AS COLUMN_NAME, " +
+                "COALESCE(col_description(c.oid, a.attnum), '') AS COLUMN_COMMENT, " +
+                "format_type(a.atttypid, a.atttypmod) AS DATA_TYPE, " +
+                "CASE WHEN a.attnotnull THEN 0 ELSE 1 END AS IS_NULLABLE " +
+                "FROM pg_attribute a " +
+                "JOIN pg_class c ON a.attrelid = c.oid " +
+                "JOIN pg_namespace n ON c.relnamespace = n.oid " +
+                "WHERE n.nspname = '" + targetSchema + "' AND c.relkind = 'r' " +
+                "AND a.attnum > 0 AND NOT a.attisdropped " +
+                "ORDER BY c.relname, a.attnum";
+        List<Map<String, Object>> allColumns = jdbcTemplate.queryForList(columnSql);
+        Map<String, List<Map<String, Object>>> columnsByTable = groupColumnsByTable(allColumns, pkMap);
+
+        // 组装结果
+        return buildTableSchemaResult(tables, columnsByTable, pkMap);
+    }
+
+    /**
+     * 构建主键映射表: tableName -> comma-separated primary key columns
+     */
+    private Map<String, String> buildPrimaryKeyMap(List<Map<String, Object>> pkList) {
+        Map<String, String> map = new HashMap<>();
+        for (Map<String, Object> row : pkList) {
+            String tableName = getStringValue(row, "TABLE_NAME");
+            String pkCols = getStringValue(row, "PK_COLUMNS");
+            if (tableName != null && pkCols != null) {
+                map.put(tableName, pkCols);
+            }
+        }
+        return map;
+    }
+
+    /**
+     * 将列按表名分组
+     */
+    private Map<String, List<Map<String, Object>>> groupColumnsByTable(
+            List<Map<String, Object>> allColumns, Map<String, String> pkMap) {
+        Map<String, List<Map<String, Object>>> map = new LinkedHashMap<>();
+        for (Map<String, Object> col : allColumns) {
+            String tableName = getStringValue(col, "TABLE_NAME");
+            if (tableName == null) continue;
+            map.computeIfAbsent(tableName, k -> new ArrayList<>()).add(col);
+        }
+        return map;
+    }
+
+    /**
+     * 组装最终的表结构结果
+     */
+    private List<Map<String, Object>> buildTableSchemaResult(
+            List<Map<String, Object>> tables,
+            Map<String, List<Map<String, Object>>> columnsByTable,
+            Map<String, String> pkMap) {
+
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> table : tables) {
+            String tableName = getStringValue(table, "TABLE_NAME");
+            if (tableName == null) continue;
+
+            Map<String, Object> tableObj = new LinkedHashMap<>();
+            tableObj.put("name", tableName);
+            tableObj.put("chinese_name", getStringValue(table, "TABLE_COMMENT"));
+            tableObj.put("primary_key", pkMap.getOrDefault(tableName, ""));
+
+            List<Map<String, Object>> columnList = columnsByTable.getOrDefault(tableName, new ArrayList<>());
+            List<Map<String, Object>> columnResult = new ArrayList<>();
+            for (Map<String, Object> col : columnList) {
+                Map<String, Object> colObj = new LinkedHashMap<>();
+                colObj.put("name", getStringValue(col, "COLUMN_NAME"));
+                colObj.put("chinese_name", getStringValue(col, "COLUMN_COMMENT"));
+                colObj.put("data_type", getStringValue(col, "DATA_TYPE"));
+
+                String tableNameKey = getStringValue(col, "TABLE_NAME");
+                String pkCols = pkMap.getOrDefault(tableNameKey, "");
+                String colName = getStringValue(col, "COLUMN_NAME");
+                colObj.put("is_primary_key", pkCols.contains(colName));
+
+                Object nullable = col.get("IS_NULLABLE");
+                colObj.put("nullable", nullable != null && (Integer.parseInt(nullable.toString()) == 1));
+
+                columnResult.add(colObj);
+            }
+            tableObj.put("columns", columnResult);
+            result.add(tableObj);
+        }
+        return result;
+    }
+
+    /**
+     * 安全获取字符串值
+     */
+    private String getStringValue(Map<String, Object> row, String key) {
+        Object val = row.get(key);
+        if (val == null) return "";
+        return val.toString();
     }
 }
