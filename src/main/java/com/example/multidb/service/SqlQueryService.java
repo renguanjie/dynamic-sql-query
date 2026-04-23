@@ -76,7 +76,7 @@ public class SqlQueryService {
 
             // 根据数据库类型执行不同的元数据查询
             if ("mysql".equals(dbType) || "oceanbase".equals(dbType)) {
-                return queryMetadataForMySQL(dbName);
+                return queryMetadataForMySQL(schema);
             } else if ("oracle".equals(dbType)) {
                 return queryMetadataForOracle(schema);
             } else if ("postgresql".equals(dbType) || "opengauss".equals(dbType)) {
@@ -125,29 +125,58 @@ public class SqlQueryService {
     /**
      * MySQL / OceanBase (MySQL兼容模式) 元数据查询
      */
-    private List<Map<String, Object>> queryMetadataForMySQL(String dbName) {
+    private List<Map<String, Object>> queryMetadataForMySQL(String schema) {
+        String trimmedSchema = (schema != null) ? schema.trim() : "";
+        boolean useCurrentDb = trimmedSchema.isEmpty();
+        String schemaName = useCurrentDb ? null : trimmedSchema;
+
         // 获取所有表及注释
-        String tableSql = "SELECT TABLE_NAME, TABLE_COMMENT " +
-                "FROM information_schema.tables " +
-                "WHERE table_schema = DATABASE() AND TABLE_TYPE = 'BASE TABLE' " +
-                "ORDER BY TABLE_NAME";
+        String tableSql;
+        if (useCurrentDb) {
+            tableSql = "SELECT TABLE_NAME, TABLE_COMMENT " +
+                    "FROM information_schema.tables " +
+                    "WHERE table_schema = DATABASE() AND TABLE_TYPE = 'BASE TABLE' " +
+                    "ORDER BY TABLE_NAME";
+        } else {
+            tableSql = "SELECT TABLE_NAME, TABLE_COMMENT " +
+                    "FROM information_schema.tables " +
+                    "WHERE table_schema = '" + schemaName + "' AND TABLE_TYPE = 'BASE TABLE' " +
+                    "ORDER BY TABLE_NAME";
+        }
 
         List<Map<String, Object>> tables = jdbcTemplate.queryForList(tableSql);
 
         // 获取所有主键信息
-        String pkSql = "SELECT TABLE_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) AS PK_COLUMNS " +
-                "FROM information_schema.KEY_COLUMN_USAGE " +
-                "WHERE table_schema = DATABASE() AND CONSTRAINT_NAME = 'PRIMARY' " +
-                "GROUP BY TABLE_NAME";
+        String pkSql;
+        if (useCurrentDb) {
+            pkSql = "SELECT TABLE_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) AS PK_COLUMNS " +
+                    "FROM information_schema.KEY_COLUMN_USAGE " +
+                    "WHERE table_schema = DATABASE() AND CONSTRAINT_NAME = 'PRIMARY' " +
+                    "GROUP BY TABLE_NAME";
+        } else {
+            pkSql = "SELECT TABLE_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) AS PK_COLUMNS " +
+                    "FROM information_schema.KEY_COLUMN_USAGE " +
+                    "WHERE table_schema = '" + schemaName + "' AND CONSTRAINT_NAME = 'PRIMARY' " +
+                    "GROUP BY TABLE_NAME";
+        }
         List<Map<String, Object>> pkList = jdbcTemplate.queryForList(pkSql);
         Map<String, String> pkMap = buildPrimaryKeyMap(pkList);
 
         // 获取所有列信息
-        String columnSql = "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT, COLUMN_TYPE, " +
-                "CASE WHEN IS_NULLABLE = 'YES' THEN 1 ELSE 0 END AS IS_NULLABLE " +
-                "FROM information_schema.columns " +
-                "WHERE table_schema = DATABASE() " +
-                "ORDER BY TABLE_NAME, ORDINAL_POSITION";
+        String columnSql;
+        if (useCurrentDb) {
+            columnSql = "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT, COLUMN_TYPE, " +
+                    "CASE WHEN IS_NULLABLE = 'YES' THEN 1 ELSE 0 END AS IS_NULLABLE " +
+                    "FROM information_schema.columns " +
+                    "WHERE table_schema = DATABASE() " +
+                    "ORDER BY TABLE_NAME, ORDINAL_POSITION";
+        } else {
+            columnSql = "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT, COLUMN_TYPE, " +
+                    "CASE WHEN IS_NULLABLE = 'YES' THEN 1 ELSE 0 END AS IS_NULLABLE " +
+                    "FROM information_schema.columns " +
+                    "WHERE table_schema = '" + schemaName + "' " +
+                    "ORDER BY TABLE_NAME, ORDINAL_POSITION";
+        }
         List<Map<String, Object>> allColumns = jdbcTemplate.queryForList(columnSql);
         Map<String, List<Map<String, Object>>> columnsByTable = groupColumnsByTable(allColumns, pkMap);
 
@@ -159,34 +188,54 @@ public class SqlQueryService {
      * Oracle 元数据查询
      */
     private List<Map<String, Object>> queryMetadataForOracle(String schema) {
-        String upperSchema = (schema != null && !schema.isEmpty()) ? schema.toUpperCase() : "USER";
+        // 不传 schema 时查询当前用户（用 USER_* 视图，无需额外权限）
+        String trimmedSchema = (schema != null) ? schema.trim() : "";
+        boolean useCurrentUser = trimmedSchema.isEmpty();
+        String upperSchema = trimmedSchema.toUpperCase();
 
-        // 获取所有表及注释
-        String tableSql = "SELECT t.TABLE_Name, c.Comments AS TABLE_COMMENT " +
-                "FROM ALL_TABLES t " +
-                "LEFT JOIN ALL_TAB_COMMENTS c ON c.TABLE_NAME = t.TABLE_NAME AND c.OWNER = t.OWNER " +
-                "WHERE t.OWNER = '" + upperSchema + "' " +
-                "ORDER BY t.TABLE_NAME";
-
+        // 获取所有表
+        String tableSql = useCurrentUser
+                ? "SELECT t.TABLE_NAME, " +
+                "(SELECT c.COMMENTS FROM USER_TAB_COMMENTS c WHERE c.TABLE_NAME = t.TABLE_NAME) AS TABLE_COMMENT " +
+                "FROM USER_TABLES t ORDER BY t.TABLE_NAME"
+                : "SELECT t.TABLE_NAME, " +
+                "(SELECT c.COMMENTS FROM ALL_TAB_COMMENTS c " +
+                "WHERE c.TABLE_NAME = t.TABLE_NAME AND c.OWNER = t.OWNER) AS TABLE_COMMENT " +
+                "FROM ALL_TABLES t WHERE t.OWNER = '" + upperSchema + "' ORDER BY t.TABLE_NAME";
         List<Map<String, Object>> tables = jdbcTemplate.queryForList(tableSql);
 
         // 获取所有主键信息
-        String pkSql = "SELECT acc.Table_Name, LISTAGG(accol.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY accol.POSITION) AS PK_COLUMNS " +
+        String pkSql = useCurrentUser
+                ? "SELECT acc.TABLE_NAME, " +
+                "LISTAGG(accol.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY accol.POSITION) AS PK_COLUMNS " +
+                "FROM USER_CONSTRAINTS acc " +
+                "JOIN USER_CONS_COLUMNS accol ON acc.CONSTRAINT_NAME = accol.CONSTRAINT_NAME " +
+                "WHERE acc.CONSTRAINT_TYPE = 'P' " +
+                "GROUP BY acc.TABLE_NAME"
+                : "SELECT acc.TABLE_NAME, " +
+                "LISTAGG(accol.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY accol.POSITION) AS PK_COLUMNS " +
                 "FROM ALL_CONSTRAINTS acc " +
-                "JOIN ALL_CON_COLUMNS accol ON acc.CONSTRAINT_NAME = accol.CONSTRAINT_NAME AND acc.OWNER = accol.OWNER " +
+                // 【修复】：改为 ALL_CONS_COLUMNS
+                "JOIN ALL_CONS_COLUMNS accol ON acc.CONSTRAINT_NAME = accol.CONSTRAINT_NAME AND acc.OWNER = accol.OWNER " +
                 "WHERE acc.OWNER = '" + upperSchema + "' AND acc.CONSTRAINT_TYPE = 'P' " +
-                "GROUP BY acc.Table_Name";
+                "GROUP BY acc.TABLE_NAME";
         List<Map<String, Object>> pkList = jdbcTemplate.queryForList(pkSql);
         Map<String, String> pkMap = buildPrimaryKeyMap(pkList);
 
         // 获取所有列信息
-        String columnSql = "SELECT tc.TABLE_NAME, tc.COLUMN_NAME, cc.COMMENTS AS COLUMN_COMMENT, " +
-                "tc.DATA_TYPE, tc.DATA_LENGTH, " +
+        String columnSql = useCurrentUser
+                ? "SELECT tc.TABLE_NAME, tc.COLUMN_NAME, " +
+                "(SELECT cc.COMMENTS FROM USER_COL_COMMENTS cc WHERE cc.TABLE_NAME = tc.TABLE_NAME AND cc.COLUMN_NAME = tc.COLUMN_NAME) AS COLUMN_COMMENT, " +
+                "tc.DATA_TYPE, " +
                 "CASE WHEN tc.NULLABLE = 'Y' THEN 1 ELSE 0 END AS IS_NULLABLE " +
-                "FROM ALL_TAB_COLS tc " +
-                "LEFT JOIN ALL_COL_COMMENTS cc ON cc.TABLE_NAME = tc.TABLE_NAME " +
-                "    AND cc.COLUMN_NAME = tc.COLUMN_NAME AND cc.OWNER = tc.OWNER " +
-                "WHERE tc.OWNER = '" + upperSchema + "' AND tc.HIDDEN_COLUMN = 'NO' " +
+                "FROM USER_TAB_COLUMNS tc ORDER BY tc.TABLE_NAME, tc.COLUMN_ID"
+                : "SELECT tc.TABLE_NAME, tc.COLUMN_NAME, " +
+                "(SELECT cc.COMMENTS FROM ALL_COL_COMMENTS cc " +
+                "WHERE cc.TABLE_NAME = tc.TABLE_NAME AND cc.COLUMN_NAME = tc.COLUMN_NAME AND cc.OWNER = tc.OWNER) AS COLUMN_COMMENT, " +
+                "tc.DATA_TYPE, " +
+                "CASE WHEN tc.NULLABLE = 'Y' THEN 1 ELSE 0 END AS IS_NULLABLE " +
+                "FROM ALL_TAB_COLUMNS tc " +
+                "WHERE tc.OWNER = '" + upperSchema + "' " +
                 "ORDER BY tc.TABLE_NAME, tc.COLUMN_ID";
         List<Map<String, Object>> allColumns = jdbcTemplate.queryForList(columnSql);
         Map<String, List<Map<String, Object>>> columnsByTable = groupColumnsByTable(allColumns, pkMap);
@@ -199,7 +248,7 @@ public class SqlQueryService {
      * openGauss (PostgreSQL兼容) 元数据查询
      */
     private List<Map<String, Object>> queryMetadataForPostgreSQL(String schema) {
-        String targetSchema = (schema != null && !schema.isEmpty()) ? schema : "public";
+        String targetSchema = (schema != null && !schema.trim().isEmpty()) ? schema.trim() : "public";
 
         // 获取所有表及注释
         String tableSql = "SELECT c.relname AS TABLE_NAME, " +
@@ -211,14 +260,17 @@ public class SqlQueryService {
 
         List<Map<String, Object>> tables = jdbcTemplate.queryForList(tableSql);
 
-        // 获取所有主键信息
+        // 获取所有主键信息（避免使用 array_position，该函数在部分 openGauss 版本存在 bug）
+        // 改用 generate_subscripts 替代 array_position
         String pkSql = "SELECT t.relname AS TABLE_NAME, " +
-                "string_agg(a.attname, ',' ORDER BY array_position(pk.conkey, a.attnum)) AS PK_COLUMNS " +
+                "string_agg(a.attname, ',' ORDER BY s.n) AS PK_COLUMNS " +
                 "FROM pg_constraint pk " +
                 "JOIN pg_class t ON pk.conrelid = t.oid " +
                 "JOIN pg_namespace n ON t.relnamespace = n.oid " +
-                "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(pk.conkey) " +
+                "JOIN pg_attribute a ON a.attrelid = t.oid " +
+                ", generate_subscripts(pk.conkey, 1) s(n) " +
                 "WHERE n.nspname = '" + targetSchema + "' AND pk.contype = 'p' " +
+                "AND a.attnum = pk.conkey[s.n] " +
                 "GROUP BY t.relname";
         List<Map<String, Object>> pkList = jdbcTemplate.queryForList(pkSql);
         Map<String, String> pkMap = buildPrimaryKeyMap(pkList);
