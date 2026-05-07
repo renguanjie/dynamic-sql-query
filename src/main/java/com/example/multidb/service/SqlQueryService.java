@@ -17,7 +17,6 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 
@@ -31,6 +30,18 @@ public class SqlQueryService {
 
     private static final String OPENGAUSS_DS = "opengauss";
     private static final int MAX_SYNC_ROWS = 5000;
+
+    private static final DateTimeFormatter F_YMD_DASH = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+    private static final DateTimeFormatter F_YMD_SLASH = DateTimeFormatter.ofPattern("yyyy/MM/dd");
+    private static final DateTimeFormatter F_YMD_DASH_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final DateTimeFormatter F_YMD_SLASH_TIME = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss");
+    private static final DateTimeFormatter F_YMD_ISO = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss");
+    private static final DateTimeFormatter F_YMD_TIME_1S = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.S");
+    private static final DateTimeFormatter F_YMD_TIME_3S = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+    private static final DateTimeFormatter F_YMD_TIME_6S = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS");
+    private static final DateTimeFormatter F_YM_DASH = DateTimeFormatter.ofPattern("yyyy-MM");
+    private static final DateTimeFormatter F_YMD_COMPACT = DateTimeFormatter.ofPattern("yyyyMMdd");
+    private static final DateTimeFormatter F_YM_COMPACT = DateTimeFormatter.ofPattern("yyyyMM");
 
     private final JdbcTemplate jdbcTemplate;
     private final Environment environment;
@@ -76,7 +87,7 @@ public class SqlQueryService {
 
     /**
      * SQLite 查询流程：传入的 SQL 已是合法的 SQLite 语句（表名为简化后的 SQLite 表名）。
-     * 通过 TargetTable 反向查找 openGauss 表名 → 同步数据 → 直接用原始 SQL 执行。
+     * 通过 TargetTable 反向查找 openGauss 表名 → 同步数据 → 执行查询 → finally 清理临时表。
      */
     private synchronized List<Map<String, Object>> executeQueryOnSqlite(String sql, Set<String> tableNames) {
         log.info("SQLite 查询流程，原始SQL：{}", sql);
@@ -86,27 +97,42 @@ public class SqlQueryService {
         }
         log.info("从SQL中提取到 SQLite 表名：{}", tableNames);
 
-        // 反查 openGauss 表名，构建同步列表
-        List<String> unconfiguredTables = new ArrayList<>();
-        for (String sqliteTable : tableNames) {
-            String ogTable = targetTable.findOpenGaussTableName(sqliteTable);
-            if (ogTable == null) {
-                unconfiguredTables.add(sqliteTable);
-            } else {
-                syncTableFromOpenGauss(ogTable, sqliteTable);
-            }
-        }
-
-        if (!unconfiguredTables.isEmpty()) {
-            throw new IllegalArgumentException("SQL 中引用了未配置的 SQLite 表：" + unconfiguredTables);
-        }
-
-        // SQL 已经是合法的 SQLite 语句，直接执行
         try {
+            // 反查 openGauss 表名，构建同步列表
+            List<String> unconfiguredTables = new ArrayList<>();
+            for (String sqliteTable : tableNames) {
+                String ogTable = targetTable.findOpenGaussTableName(sqliteTable);
+                if (ogTable == null) {
+                    unconfiguredTables.add(sqliteTable);
+                } else {
+                    syncTableFromOpenGauss(ogTable, sqliteTable);
+                }
+            }
+
+            if (!unconfiguredTables.isEmpty()) {
+                throw new IllegalArgumentException("SQL 中引用了未配置的 SQLite 表：" + unconfiguredTables);
+            }
+
+            // 执行查询
             log.info("执行 SQLite 查询：{}", sql);
             return sqliteJdbcTemplate.queryForList(sql);
+        } catch (RuntimeException e) {
+            throw e;
         } catch (Exception e) {
             throw new RuntimeException("SQLite 查询执行失败：" + e.getMessage(), e);
+        } finally {
+            // 清理本次查询产生的临时表，防止内存泄漏
+            for (String tableName : tableNames) {
+                if (isSystemTable(tableName)) {
+                    continue;
+                }
+                try {
+                    sqliteJdbcTemplate.execute("DROP TABLE IF EXISTS " + tableName);
+                    log.info("清理 SQLite 临时表：{}", tableName);
+                } catch (Exception e) {
+                    log.error("清理 SQLite 临时表失败：{}，原因：{}", tableName, e.getMessage());
+                }
+            }
         }
     }
 
@@ -297,31 +323,48 @@ public class SqlQueryService {
     // ==================== SQLite 自定义函数 ====================
 
     private static LocalDate parseDate(String dateStr) {
-        if (dateStr == null || dateStr.trim().isEmpty()) {
+        if (dateStr == null || dateStr.isEmpty()) {
             throw new IllegalArgumentException("日期参数不能为空");
         }
         dateStr = dateStr.trim();
-
-        DateTimeFormatter[] formatters = {
-                DateTimeFormatter.ofPattern("yyyy-MM-dd"),
-                DateTimeFormatter.ofPattern("yyyy/MM/dd"),
-                DateTimeFormatter.ofPattern("yyyyMMdd"),
-                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
-                DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss"),
-                DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"),
-                DateTimeFormatter.ofPattern("yyyy-MM"),
-                DateTimeFormatter.ofPattern("yyyyMM"),
-                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.S"),
-                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"),
-                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS"),
-        };
-
-        for (DateTimeFormatter formatter : formatters) {
-            try {
-                return LocalDate.parse(dateStr, formatter);
-            } catch (DateTimeParseException ignored) {
-            }
+        if (dateStr.isEmpty()) {
+            throw new IllegalArgumentException("日期参数不能为空");
         }
+
+        int len = dateStr.length();
+
+        // 带小数位的日期时间（带毫秒/微秒）
+        if (dateStr.indexOf('.') >= 0) {
+            int dotPos = dateStr.indexOf('.');
+            int fracLen = len - dotPos - 1;
+            if (fracLen == 1) return LocalDate.parse(dateStr, F_YMD_TIME_1S);
+            if (fracLen == 3) return LocalDate.parse(dateStr, F_YMD_TIME_3S);
+            if (fracLen == 6) return LocalDate.parse(dateStr, F_YMD_TIME_6S);
+            // 其他小数位数，尝试就近的格式
+            return LocalDate.parse(dateStr, F_YMD_TIME_3S);
+        }
+
+        // 带时间的格式
+        if (len >= 19) {
+            char sep = dateStr.charAt(4);
+            if (dateStr.contains("T")) return LocalDate.parse(dateStr, F_YMD_ISO);
+            if (sep == '/') return LocalDate.parse(dateStr, F_YMD_SLASH_TIME);
+            return LocalDate.parse(dateStr, F_YMD_DASH_TIME);
+        }
+
+        // 纯日期格式
+        if (len == 10) {
+            char sep = dateStr.charAt(4);
+            if (sep == '/') return LocalDate.parse(dateStr, F_YMD_SLASH);
+            return LocalDate.parse(dateStr, F_YMD_DASH);
+        }
+
+        // 年月格式
+        if (len == 7) return LocalDate.parse(dateStr, F_YM_DASH);
+
+        // 紧凑型
+        if (len == 8) return LocalDate.parse(dateStr, F_YMD_COMPACT);
+        if (len == 6) return LocalDate.parse(dateStr, F_YM_COMPACT);
 
         throw new IllegalArgumentException("无法解析日期格式：" + dateStr);
     }
@@ -452,17 +495,25 @@ public class SqlQueryService {
             String placeholders = String.join(",", Collections.nCopies(colNames.length, "?"));
             String insertSql = "INSERT INTO " + sqliteTableName + " (" + String.join(",", colNames) + ") VALUES (" + placeholders + ")";
 
-            sqliteJdbcTemplate.batchUpdate(insertSql, rows, rows.size(), (ps, row) -> {
-                for (int i = 0; i < colNames.length; i++) {
-                    Object val = row.get(colNames[i]);
-                    if (val != null && "org.postgresql.util.PGobject".equals(val.getClass().getName())) {
-                        val = val.toString();
+            // 【关键修复】：显式开启 SQLite 事务，将插入速度提升百倍！防止超时！
+            sqliteJdbcTemplate.execute("BEGIN TRANSACTION;");
+            try {
+                sqliteJdbcTemplate.batchUpdate(insertSql, rows, rows.size(), (ps, row) -> {
+                    for (int i = 0; i < colNames.length; i++) {
+                        Object val = row.get(colNames[i]);
+                        if (val != null && "org.postgresql.util.PGobject".equals(val.getClass().getName())) {
+                            val = val.toString();
+                        }
+                        ps.setObject(i + 1, val);
                     }
-                    ps.setObject(i + 1, val);
-                }
-            });
+                });
+                sqliteJdbcTemplate.execute("COMMIT;"); // 成功则提交
+            } catch (Exception e) {
+                sqliteJdbcTemplate.execute("ROLLBACK;"); // 失败则回滚
+                throw e; // 抛出异常
+            }
 
-            log.info("向 SQLite 表 {} 插入 {} 行数据", sqliteTableName, rows.size());
+            log.info("向 SQLite 表 {} 插入 {} 行数据完成", sqliteTableName, rows.size());
         } finally {
             DynamicDataSourceContextHolder.clear();
         }
