@@ -17,6 +17,8 @@ public class JdbcConfig {
         JdbcTemplate jdbcTemplate = new JdbcTemplate(dataSource);
         // 单条SQL最大执行时间60秒，超时自动终止并释放连接
         jdbcTemplate.setQueryTimeout(60);
+        // 限制最大返回行数为1000，防止大表查询导致OOM
+        jdbcTemplate.setMaxRows(1000);
         return jdbcTemplate;
     }
 }

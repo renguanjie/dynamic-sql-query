@@ -12,7 +12,7 @@
     <artifactId>multi-db-sql-query</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>multi-db-sql-query</name>
-    <description>多数据库SQL查询封装项目，支持MySQL、Oracle、OceanBase、openGauss</description>
+    <description>多数据库SQL查询封装项目，支持MySQL、Oracle、OceanBase、openGauss、SQLite</description>
     <properties>
         <java.version>1.8</java.version>
     </properties>
@@ -68,11 +68,26 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!-- SQLite JDBC 驱动 -->
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>3.45.1.0</version>
+            <scope>runtime</scope>
+        </dependency>
+
         <!-- 测试依赖 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
+        </dependency>
+
+        <!-- JSqlParser SQL解析器 -->
+        <dependency>
+            <groupId>com.github.jsqlparser</groupId>
+            <artifactId>jsqlparser</artifactId>
+            <version>4.9</version>
         </dependency>
     </dependencies>
 
