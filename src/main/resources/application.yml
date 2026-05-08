@@ -30,8 +30,10 @@ spring:
         oracle:
           driver-class-name: oracle.jdbc.OracleDriver
           url: jdbc:oracle:thin:@//localhost:1521/ORCLPDB1
-          username: system
-          password: oracle
+          username: your_username
+          password: your_password
+          hikari:
+            connection-init-sql: ALTER SESSION SET CURRENT_SCHEMA = YOUR_SCHEMA
         # OceanBase数据源，dbName传"oceanbase"即可使用
         oceanbase:
           driver-class-name: com.oceanbase.jdbc.Driver

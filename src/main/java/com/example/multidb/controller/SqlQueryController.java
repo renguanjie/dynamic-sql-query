@@ -32,7 +32,7 @@ public class SqlQueryController {
      */
     @PostMapping("/query")
     public R<List<Map<String, Object>>> query(@RequestBody SqlQueryRequest request) {
-        List<Map<String, Object>> result = sqlQueryService.executeQuery(request.getDbName(), request.getSql());
+        List<Map<String, Object>> result = sqlQueryService.executeQuery(request.getDbName(), request.getSql(), request.getSchema());
         return R.ok(result);
     }
 

@@ -60,6 +60,13 @@ public class SqlQueryService {
      * 执行SQL查询
      */
     public List<Map<String, Object>> executeQuery(String dbName, String sql) {
+        return executeQuery(dbName, sql, null);
+    }
+
+    /**
+     * 执行SQL查询，可指定模式名（仅Oracle/openGauss有效）
+     */
+    public List<Map<String, Object>> executeQuery(String dbName, String sql, String schema) {
         if (dbName == null || dbName.trim().isEmpty()) {
             throw new IllegalArgumentException("数据库名称不能为空");
         }
@@ -75,9 +82,28 @@ public class SqlQueryService {
             return executeQueryOnSqlite(sql, parseResult.getTableNames());
         }
 
-        log.info("执行SQL查询，数据源：{}，SQL：{}", dbName, sql);
+        log.info("执行SQL查询，数据源：{}，SQL：{}，schema：{}", dbName, sql, schema);
         try {
             DynamicDataSourceContextHolder.push(dbName);
+
+            // 如果指定了schema，针对不同数据库类型设置当前模式
+            if (schema != null && !schema.trim().isEmpty()) {
+                String dbType = getDbType(dbName);
+                if ("oracle".equals(dbType)) {
+                    String cleanSchema = schema.trim().toUpperCase();
+                    if (!cleanSchema.matches("^[A-Z0-9_]+$")) {
+                        throw new IllegalArgumentException("非法的 schema 名称，仅允许字母、数字和下划线");
+                    }
+                    jdbcTemplate.execute("ALTER SESSION SET CURRENT_SCHEMA = " + cleanSchema);
+                } else if ("opengauss".equals(dbType)) {
+                    String cleanSchema = schema.trim();
+                    if (!cleanSchema.matches("^[a-zA-Z0-9_]+$")) {
+                        throw new IllegalArgumentException("非法的 schema 名称，仅允许字母、数字和下划线");
+                    }
+                    jdbcTemplate.execute("SET search_path TO " + cleanSchema);
+                }
+            }
+
             return jdbcTemplate.queryForList(sql);
         } finally {
             DynamicDataSourceContextHolder.clear();
@@ -426,7 +452,7 @@ public class SqlQueryService {
                     "FROM pg_attribute a " +
                     "JOIN pg_class c ON a.attrelid = c.oid " +
                     "JOIN pg_namespace n ON c.relnamespace = n.oid " +
-                    "WHERE n.nspname = 'public' AND c.relname = '" + targetDbTableName + "' " +
+                    "WHERE n.nspname = current_schema() AND c.relname = '" + targetDbTableName + "' " +
                     "AND a.attnum > 0 AND NOT a.attisdropped " +
                     "ORDER BY a.attnum";
 
@@ -535,10 +561,12 @@ public class SqlQueryService {
         } else {
             tableSql = "SELECT TABLE_NAME, TABLE_COMMENT " +
                     "FROM information_schema.tables " +
-                    "WHERE table_schema = '" + schemaName + "' AND TABLE_TYPE = 'BASE TABLE' " +
+                    "WHERE table_schema = ? AND TABLE_TYPE = 'BASE TABLE' " +
                     "ORDER BY TABLE_NAME";
         }
-        List<Map<String, Object>> tables = jdbcTemplate.queryForList(tableSql);
+        List<Map<String, Object>> tables = useCurrentDb
+                ? jdbcTemplate.queryForList(tableSql)
+                : jdbcTemplate.queryForList(tableSql, schemaName);
 
         String pkSql;
         if (useCurrentDb) {
@@ -549,10 +577,12 @@ public class SqlQueryService {
         } else {
             pkSql = "SELECT TABLE_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) AS PK_COLUMNS " +
                     "FROM information_schema.KEY_COLUMN_USAGE " +
-                    "WHERE table_schema = '" + schemaName + "' AND CONSTRAINT_NAME = 'PRIMARY' " +
+                    "WHERE table_schema = ? AND CONSTRAINT_NAME = 'PRIMARY' " +
                     "GROUP BY TABLE_NAME";
         }
-        List<Map<String, Object>> pkList = jdbcTemplate.queryForList(pkSql);
+        List<Map<String, Object>> pkList = useCurrentDb
+                ? jdbcTemplate.queryForList(pkSql)
+                : jdbcTemplate.queryForList(pkSql, schemaName);
         Map<String, String> pkMap = buildPrimaryKeyMap(pkList);
 
         String columnSql;
@@ -566,10 +596,12 @@ public class SqlQueryService {
             columnSql = "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT, COLUMN_TYPE, " +
                     "CASE WHEN IS_NULLABLE = 'YES' THEN 1 ELSE 0 END AS IS_NULLABLE " +
                     "FROM information_schema.columns " +
-                    "WHERE table_schema = '" + schemaName + "' " +
+                    "WHERE table_schema = ? " +
                     "ORDER BY TABLE_NAME, ORDINAL_POSITION";
         }
-        List<Map<String, Object>> allColumns = jdbcTemplate.queryForList(columnSql);
+        List<Map<String, Object>> allColumns = useCurrentDb
+                ? jdbcTemplate.queryForList(columnSql)
+                : jdbcTemplate.queryForList(columnSql, schemaName);
         Map<String, List<Map<String, Object>>> columnsByTable = groupColumnsByTable(allColumns, pkMap);
 
         return buildTableSchemaResult(tables, columnsByTable, pkMap);
@@ -582,6 +614,7 @@ public class SqlQueryService {
         boolean useCurrentUser = trimmedSchema.isEmpty();
         String upperSchema = trimmedSchema.toUpperCase();
 
+        // 1. 获取表名和注释
         String tableSql = useCurrentUser
                 ? "SELECT t.TABLE_NAME, " +
                 "(SELECT c.COMMENTS FROM USER_TAB_COMMENTS c WHERE c.TABLE_NAME = t.TABLE_NAME) AS TABLE_COMMENT " +
@@ -589,9 +622,12 @@ public class SqlQueryService {
                 : "SELECT t.TABLE_NAME, " +
                 "(SELECT c.COMMENTS FROM ALL_TAB_COMMENTS c " +
                 "WHERE c.TABLE_NAME = t.TABLE_NAME AND c.OWNER = t.OWNER) AS TABLE_COMMENT " +
-                "FROM ALL_TABLES t WHERE t.OWNER = '" + upperSchema + "' ORDER BY t.TABLE_NAME";
-        List<Map<String, Object>> tables = jdbcTemplate.queryForList(tableSql);
+                "FROM ALL_TABLES t WHERE t.OWNER = ? ORDER BY t.TABLE_NAME";
+        List<Map<String, Object>> tables = useCurrentUser
+                ? jdbcTemplate.queryForList(tableSql)
+                : jdbcTemplate.queryForList(tableSql, upperSchema);
 
+        // 2. 获取主键
         String pkSql = useCurrentUser
                 ? "SELECT acc.TABLE_NAME, " +
                 "LISTAGG(accol.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY accol.POSITION) AS PK_COLUMNS " +
@@ -603,11 +639,14 @@ public class SqlQueryService {
                 "LISTAGG(accol.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY accol.POSITION) AS PK_COLUMNS " +
                 "FROM ALL_CONSTRAINTS acc " +
                 "JOIN ALL_CONS_COLUMNS accol ON acc.CONSTRAINT_NAME = accol.CONSTRAINT_NAME AND acc.OWNER = accol.OWNER " +
-                "WHERE acc.OWNER = '" + upperSchema + "' AND acc.CONSTRAINT_TYPE = 'P' " +
+                "WHERE acc.OWNER = ? AND acc.CONSTRAINT_TYPE = 'P' " +
                 "GROUP BY acc.TABLE_NAME";
-        List<Map<String, Object>> pkList = jdbcTemplate.queryForList(pkSql);
+        List<Map<String, Object>> pkList = useCurrentUser
+                ? jdbcTemplate.queryForList(pkSql)
+                : jdbcTemplate.queryForList(pkSql, upperSchema);
         Map<String, String> pkMap = buildPrimaryKeyMap(pkList);
 
+        // 3. 获取列信息
         String columnSql = useCurrentUser
                 ? "SELECT tc.TABLE_NAME, tc.COLUMN_NAME, " +
                 "(SELECT cc.COMMENTS FROM USER_COL_COMMENTS cc WHERE cc.TABLE_NAME = tc.TABLE_NAME AND cc.COLUMN_NAME = tc.COLUMN_NAME) AS COLUMN_COMMENT, " +
@@ -620,9 +659,12 @@ public class SqlQueryService {
                 "tc.DATA_TYPE, " +
                 "CASE WHEN tc.NULLABLE = 'Y' THEN 1 ELSE 0 END AS IS_NULLABLE " +
                 "FROM ALL_TAB_COLUMNS tc " +
-                "WHERE tc.OWNER = '" + upperSchema + "' " +
+                "WHERE tc.OWNER = ? " +
                 "ORDER BY tc.TABLE_NAME, tc.COLUMN_ID";
-        List<Map<String, Object>> allColumns = jdbcTemplate.queryForList(columnSql);
+        List<Map<String, Object>> allColumns = useCurrentUser
+                ? jdbcTemplate.queryForList(columnSql)
+                : jdbcTemplate.queryForList(columnSql, upperSchema);
+
         Map<String, List<Map<String, Object>>> columnsByTable = groupColumnsByTable(allColumns, pkMap);
 
         return buildTableSchemaResult(tables, columnsByTable, pkMap);
@@ -637,21 +679,22 @@ public class SqlQueryService {
                 "COALESCE(obj_description(c.oid, 'pg_class'), '') AS TABLE_COMMENT " +
                 "FROM pg_class c " +
                 "JOIN pg_namespace n ON c.relnamespace = n.oid " +
-                "WHERE n.nspname = '" + targetSchema + "' AND c.relkind = 'r' " +
+                "WHERE n.nspname = ? AND c.relkind = 'r' " +
                 "ORDER BY c.relname";
-        List<Map<String, Object>> tables = jdbcTemplate.queryForList(tableSql);
+        List<Map<String, Object>> tables = jdbcTemplate.queryForList(tableSql, targetSchema);
 
-        String pkSql = "SELECT t.relname AS TABLE_NAME, " +
-                "string_agg(a.attname, ',' ORDER BY s.n) AS PK_COLUMNS " +
-                "FROM pg_constraint pk " +
-                "JOIN pg_class t ON pk.conrelid = t.oid " +
-                "JOIN pg_namespace n ON t.relnamespace = n.oid " +
-                "JOIN pg_attribute a ON a.attrelid = t.oid " +
-                ", generate_subscripts(pk.conkey, 1) s(n) " +
-                "WHERE n.nspname = '" + targetSchema + "' AND pk.contype = 'p' " +
-                "AND a.attnum = pk.conkey[s.n] " +
-                "GROUP BY t.relname";
-        List<Map<String, Object>> pkList = jdbcTemplate.queryForList(pkSql);
+        // 【终极降维修复】：直接使用标准 information_schema，彻底告别 openGauss 恶心的底层数组解析 Bug
+        String pkSql = "SELECT tc.table_name AS TABLE_NAME, " +
+                "string_agg(kcu.column_name, ',' ORDER BY kcu.ordinal_position) AS PK_COLUMNS " +
+                "FROM information_schema.table_constraints tc " +
+                "JOIN information_schema.key_column_usage kcu " +
+                "  ON tc.constraint_name = kcu.constraint_name " +
+                "  AND tc.table_schema = kcu.table_schema " +
+                "  AND tc.table_name = kcu.table_name " +
+                "WHERE tc.constraint_type = 'PRIMARY KEY' " +
+                "  AND tc.table_schema = ? " +
+                "GROUP BY tc.table_name";
+        List<Map<String, Object>> pkList = jdbcTemplate.queryForList(pkSql, targetSchema);
         Map<String, String> pkMap = buildPrimaryKeyMap(pkList);
 
         String columnSql = "SELECT c.relname AS TABLE_NAME, a.attname AS COLUMN_NAME, " +
@@ -661,10 +704,10 @@ public class SqlQueryService {
                 "FROM pg_attribute a " +
                 "JOIN pg_class c ON a.attrelid = c.oid " +
                 "JOIN pg_namespace n ON c.relnamespace = n.oid " +
-                "WHERE n.nspname = '" + targetSchema + "' AND c.relkind = 'r' " +
+                "WHERE n.nspname = ? AND c.relkind = 'r' " +
                 "AND a.attnum > 0 AND NOT a.attisdropped " +
                 "ORDER BY c.relname, a.attnum";
-        List<Map<String, Object>> allColumns = jdbcTemplate.queryForList(columnSql);
+        List<Map<String, Object>> allColumns = jdbcTemplate.queryForList(columnSql, targetSchema);
         Map<String, List<Map<String, Object>>> columnsByTable = groupColumnsByTable(allColumns, pkMap);
 
         return buildTableSchemaResult(tables, columnsByTable, pkMap);
